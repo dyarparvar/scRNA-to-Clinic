@@ -1,4 +1,4 @@
-# Data Science in Life Sciences
+# scRNA to Clinic
 
 This repo is where I'm building my applied data science skills in life sciences — working through scRNA-seq, multi-omics, spatial transcriptomics, and clinical biostatistics with real tools and datasets, as I apply to roles at the intersection of life sciences and data science.
 

@@ -7,7 +7,7 @@ This repo is where I'm building my applied data science skills in life sciences 
 | Module | Topic | Tools |
 |---|---|---|
 | 1 | scRNA-seq foundations | Python, Scanpy |
-| 2 | Clinical biostatistics | R, lme4, survival |
+| 2 | Clinical biostatistics | R, lme4, lmerTest, survival, survminer, mediation, simr |
 | 3 | Multi-omics integration | Python, NMF, MOFA2 |
 | 4 | Spatial transcriptomics | Python, Squidpy |
 | 5 | Flow cytometry analysis | R, Spectre |

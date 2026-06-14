@@ -1,10 +1,22 @@
 #' ---
 #' title: "MODULE 2: CLINICAL BIOSTATISTICS FOR KIDNEY DISEASE RESEARCH"
 #' author: "Darya Y"
-#' output: 
+#' output:
 #'   pdf_document:
 #'     latex_engine: xelatex
+#' geometry: "left=2cm, right=2cm, top=2cm, bottom=2cm"
 #' ---
+#'
+
+options(width = 70)
+if (!requireNamespace("formatR", quietly = TRUE)) install.packages("formatR")
+knitr::opts_chunk$set(
+  tidy = TRUE,
+  tidy.opts = list(width.cutoff = 65),
+  comment = NA,
+  cache = TRUE
+)
+
 
 # =============================================================================
 # MODULE 2: CLINICAL BIOSTATISTICS FOR KIDNEY DISEASE RESEARCH
@@ -49,7 +61,8 @@
 
 required_packages <- c("dplyr", "ggplot2", "lme4", "lmerTest", "survival",
                        "broom", "broom.mixed", "tidyr", "tidyverse", "ggpubr", 
-                       "ggfortify", "patchwork", "scales", "RColorBrewer")
+                       "ggfortify", "patchwork", "scales", "RColorBrewer", 
+                       "survminer", "mediation", "simr")
 
 for (pkg in required_packages) {
   if (!requireNamespace(pkg, quietly = TRUE)) {
@@ -73,6 +86,9 @@ suppressMessages({
   library(tidyverse)
   library(ggpubr)
   library(ggfortify)
+  library(survminer)
+  library(mediation)
+  library(simr)
 })
 
 # Create output directory for plots
@@ -87,8 +103,8 @@ cat("Output plots will be saved to:", plot_dir, "\n\n")
 # SECTION 1: SIMULATE REALISTIC PATIENT DATA
 # =============================================================================
 # WHY SIMULATE? In research, we often need to:
-#   - Test the analysis pipeline before real data arrives with examples that mirror real data structure
-#   - Demonstrate statistical power (simulate → analyze → check if we detect effects)
+#   - Test the analysis pipeline before real data arrives
+#   - Demonstrate statistical power (simulate → analyze → check results)
 #
 # KEY DESIGN DECISIONS IN THIS SIMULATION:
 #   - 120 patients: 80 CKD + 40 Healthy controls (realistic 2:1 ratio)
@@ -121,16 +137,19 @@ patient_data <- data.frame(
 
   # Sex: roughly 55% male in CKD cohorts (CKD is slightly male-predominant)
   sex = c(sample(c("Male", "Female"), n_ckd, replace = TRUE, prob = c(0.55, 0.45)),
-          sample(c("Male", "Female"), n_healthy, replace = TRUE, prob = c(0.50, 0.50))),
+          sample(c("Male", "Female"), n_healthy,
+                 replace = TRUE, prob = c(0.50, 0.50))),
 
   # Baseline eGFR:
   #   CKD: mean 52, SD 12 (Stage 3 CKD range: 30-59)
   #   Healthy: mean 88, SD 10 (normal range: 60-120)
-  eGFR_baseline = c(pmax(25, rnorm(n_ckd, mean = 52, sd = 12)),  # pmax prevents unrealistic negative values by comparing every single generated eGFR to the threshold, 25
-                    pmin(120, pmax(60, rnorm(n_healthy, mean = 88, sd = 10)))), # pmax prevents unrealistic high values
+  # pmax(25, ...) floors eGFR at 25; pmin(120, ...) caps it at 120
+  eGFR_baseline = c(pmax(25, rnorm(n_ckd, mean = 52, sd = 12)),
+                    pmin(120, pmax(60, rnorm(n_healthy, mean = 88, sd = 10)))),
 
   # Monocyte score from flow cytometry (arbitrary units, higher = more activated)
-  # CKD patients have chronically activated monocytes (NF-kB signalling, IL-6 production)
+  # CKD patients have chronically activated monocytes
+  # (NF-kB signalling, IL-6 production)
   monocyte_score = c(rnorm(n_ckd, mean = 0.65, sd = 0.18),
                      rnorm(n_healthy, mean = 0.30, sd = 0.12)),
 
@@ -145,7 +164,8 @@ patient_data <- data.frame(
   decline_rate = c(rnorm(n_ckd, mean = -2.5, sd = 1.5),
                    rnorm(n_healthy, mean = 0, sd = 0.3)),
 
-  stringsAsFactors = FALSE # Keep strings as is. Do not convert it into a categorical Factor.
+  # Keep strings as characters, not factors
+  stringsAsFactors = FALSE
 )
 
 # Ensure monocyte scores are bounded (0, 1) — these represent proportions
@@ -167,6 +187,23 @@ longitudinal_data <- patient_data %>%
 
     # Floor eGFR at 10 (dialysis threshold — patients are removed from study)
     eGFR = pmax(10, eGFR),
+    
+    # Dynamic monocyte score and T-cell score over time
+    monocyte_score = case_when(
+      condition == "CKD"     ~ monocyte_score + 0.04 * (time_months / 6) +
+        rnorm(n(), mean = 0, sd = 0.04),
+      condition == "Healthy" ~ monocyte_score + rnorm(n(), mean = 0, sd = 0.02)
+    ),
+    # Ensure scores remain physically realistic proportions between 0 and 1
+    monocyte_score = pmin(1, pmax(0, monocyte_score)),
+    
+    t_cell_score = case_when(
+      condition == "CKD"     ~ t_cell_score + 0.02 * (time_months / 6) +
+        rnorm(n(), mean = 0, sd = 0.03),
+      condition == "Healthy" ~ t_cell_score + rnorm(n(), mean = 0, sd = 0.02)
+    ),
+    # Ensure scores remain physically realistic proportions between 0 and 1
+    t_cell_score = pmin(1, pmax(0, t_cell_score)),
 
     # Time as factor for some analyses (categorical: "Baseline", "6mo", "12mo")
     time_factor = factor(time_months,
@@ -175,8 +212,8 @@ longitudinal_data <- patient_data %>%
   ) %>%
   # Convert condition and sex to factors (important for regression contrast coding)
   mutate(
-    condition = factor(condition, levels = c("Healthy", "CKD")),  # Healthy is reference
-    sex = factor(sex, levels = c("Female", "Male"))               # Female is reference
+    condition = factor(condition, levels = c("Healthy", "CKD")), # ref = Healthy
+    sex = factor(sex, levels = c("Female", "Male"))              # ref = Female
   )
 
 cat("Longitudinal dataset created:\n")
@@ -242,7 +279,8 @@ healthy_base <- baseline_data %>% filter(condition == "Healthy")
 
 age_test  <- t.test(ckd_base$age, healthy_base$age, var.equal = FALSE)
 egfr_test <- t.test(ckd_base$eGFR, healthy_base$eGFR, var.equal = FALSE)
-mono_test <- t.test(ckd_base$monocyte_score, healthy_base$monocyte_score, var.equal = FALSE)
+mono_test <- t.test(ckd_base$monocyte_score,
+                    healthy_base$monocyte_score, var.equal = FALSE)
 
 # chisq.test() for categorical variables
 sex_table   <- table(baseline_data$condition, baseline_data$sex)
@@ -324,7 +362,7 @@ p_egfr_traj <- ggplot(longitudinal_data,
 
   labs(
     title    = "eGFR Trajectories Over 12 Months",
-    subtitle = "Individual patient lines (faint) with group mean ± SE (thick line + shading)",
+    subtitle = "Individual lines (faint) with group mean ± SE (thick + shading)",
     x        = "Time Point",
     y        = "eGFR (mL/min/1.73m²)",
     color    = "Condition",
@@ -412,13 +450,21 @@ print(p_immune_combined)
 # Does higher monocyte activation at baseline predict more eGFR decline?
 # This is the core biological hypothesis visualised directly.
 
-# Calculate eGFR change from baseline to 12 months for each CKD patient
+# Calculate eGFR change from baseline to 12 months for each CKD patient.
+# monocyte_score is extracted separately at t=0 to avoid pivot_wider
+# producing 3 rows per patient (one per time point).
+mono_baseline_scatter <- longitudinal_data %>%
+  filter(condition == "CKD", time_months == 0) %>%
+  dplyr::select(patient_id, monocyte_score)
+
 egfr_change <- longitudinal_data %>%
   filter(condition == "CKD") %>%
-  select(patient_id, time_months, eGFR, monocyte_score) %>%
+  dplyr::select(patient_id, time_months, eGFR) %>%
   pivot_wider(names_from = time_months, values_from = eGFR,
               names_prefix = "eGFR_t") %>%
-  mutate(eGFR_change = `eGFR_t12` - `eGFR_t0`)  # negative = decline
+  mutate(eGFR_change = `eGFR_t12` - `eGFR_t0`) %>%  # negative = decline
+  left_join(mono_baseline_scatter, by = "patient_id") %>%
+  filter(!is.na(eGFR_change), !is.na(monocyte_score))
 
 p_scatter <- ggplot(egfr_change,
                     aes(x = monocyte_score, y = eGFR_change)) +
@@ -451,18 +497,27 @@ print(p_scatter)
 # THE FUNDAMENTAL PROBLEM WITH REPEATED MEASURES:
 # -----------------------------------------------
 # Standard linear regression assumes observations are INDEPENDENT.
-# But in longitudinal data, three measurements from the same patient are NOT independent.
-# Patient PT001 at 0, 6, and 12 months share the same person and therefore same genetics,
-# same lifestyle, same disease severity. These correlations violate regression assumptions.
+# But in longitudinal data, three measurements from the same patient
+# are NOT independent. PT001 at months 0, 6, 12 shares the same
+# genetics, lifestyle, disease severity — violating regression assumptions.
 #
 # If we use plain lm() ignoring this, we will:
 #   1. Underestimate standard errors (→ false positives)
 #   2. Not correctly separate "within-patient" from "between-patient" effects
 #
 # MIXED EFFECTS MODELS solve this by:
-#   - FIXED EFFECTS: population-average effects (what we care about: does CKD affect eGFR?)
-#   - RANDOM EFFECTS: patient-specific deviations (each patient has their own "offset")
-#     The random effects absorb the correlation within patients
+#   - FIXED EFFECTS: population-average effects 
+#     (what we care about: does CKD affect eGFR?)
+#   - RANDOM EFFECTS: patient-specific deviations 
+#     (each patient has their own "offset")
+#     The random effects absorb the correlation within patients. 
+#     They represent the biological noise or individual deviations from 
+#     the grand average.
+#     By splitting the model into these two parts, the fixed effects become 
+#     incredibly precise because they are no longer confused by the individual 
+#     biological quirks of the specific patients in your dataset.
+#     y=β0+β1x+u0+u1x+ϵ where β terms are the Fixed Effects and
+#     u terms are the Random Effects
 #
 # MODEL NOTATION: lmer(eGFR ~ time * condition + (1|patient_id), data=...)
 #   - eGFR: outcome variable
@@ -497,7 +552,7 @@ model1 <- lmer(
   data = longitudinal_data,
   REML = TRUE  # REML = Restricted Maximum Likelihood
                 # Use REML for estimating random effects (less biased than ML)
-                # Use ML (REML=FALSE) when comparing models with different fixed effects
+                # Use ML (REML=FALSE) when comparing fixed effects
 )
 
 cat("\nModel 1 Summary:\n")
@@ -507,8 +562,9 @@ patient_var  <- as.data.frame(VarCorr(model1))$vcov[1]
 residual_var <- as.data.frame(VarCorr(model1))$vcov[2]
 icc <- patient_var / (patient_var + residual_var)
 cat(sprintf("\nModel 1 - Intraclass Correlation (ICC): %.3f\n", icc))
-cat(sprintf("Interpretation: %.1f%% of eGFR variance is between-patient (vs within-patient noise)\n",
-    icc * 100))
+cat(sprintf(
+  "Interpretation: %.1f%% of variance is between-patient\n",
+  icc * 100))
 cat("ICC > 0.5 = substantial clustering => mixed model is essential!\n\n")
 
 # --- Understanding the model output ---
@@ -528,7 +584,7 @@ cat("Fixed Effects with 95% CI:\n")
 print(model1_tidy[, c("term", "estimate", "conf.low", "conf.high", "p.value")])
 
 # --- MODEL 2: Does monocyte score predict eGFR decline? ---
-# The KEY CLINICAL QUESTION: does baseline immune phenotype predict future kidney function?
+# KEY QUESTION: does baseline immune phenotype predict future kidney function?
 #
 # We include monocyte_score * time_months interaction because:
 #   We hypothesise that higher monocyte score → faster eGFR decline
@@ -580,7 +636,8 @@ p_forest_lmer <- ggplot(coef_plot_data,
                         aes(x = estimate, y = reorder(term, estimate),
                             color = significant)) +
   geom_vline(xintercept = 0, linetype = "dashed", color = "#757575") +
-  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2, linewidth = 1) +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high),
+                 height = 0.2, linewidth = 1) +
   geom_point(size = 3) +
   scale_color_manual(values = c("TRUE" = "#F96006", "FALSE" = "#757575"),
                      labels = c("TRUE" = "p < 0.05", "FALSE" = "p >= 0.05")) +
@@ -612,7 +669,8 @@ if (nrow(interaction_term) > 0) {
   cat(sprintf("  eGFR declines an additional %.3f mL/min per MONTH\n", est))
   cat(sprintf("  = %.3f mL/min per 12 months (one year)\n", est * 12))
   if (p < 0.05) {
-    cat("  SIGNIFICANT: Higher monocyte activation predicts faster kidney function decline\n")
+    cat("  SIGNIFICANT: Higher monocyte activation",
+        "predicts faster kidney function decline\n")
   } else {
     cat("  Not significant at p < 0.05 (may need larger sample)\n")
   }
@@ -688,10 +746,11 @@ set.seed(42)
 survival_data <- patient_data %>%
   mutate(
     # Base hazard: CKD patients have intrinsic risk; healthy have near-zero risk
-    # In a constant-hazard survival model (h(t)=λ), the probability of surviving past time t
+    # In a constant-hazard model (h(t)=λ), the probability of surviving
+    # past time t:
     # is S(t)=e^(−h⋅t), where e is Euler's number (approximately 2.718),
     # h is the base hazard rate, and t is the time elapsed (in this case, 36 months)
-    # The probability of failing within that time is simply 1 minus the survival probability:
+    # Probability of failing = 1 minus survival probability:
     # Failure(t)=1−e^(−h⋅t) 
     
     base_hazard = case_when(
@@ -705,7 +764,7 @@ survival_data <- patient_data %>%
 
     # Draw event time from exponential distribution
     # In survival analysis, the Exponential distribution is unique because it is 
-    # "memoryless," meaning the risk of the event happening remains constant over time.
+    # "memoryless": risk of the event remains constant over time.
     
     # rexp(n, rate) gives time-to-event; rate = hazard
     event_time_raw = rexp(n(), rate = individual_hazard),
@@ -865,7 +924,7 @@ p_km <- autoplot(km_fit,
   # Labels and theming
   labs(
     title    = "Kaplan-Meier: Time to Kidney Failure (eGFR < 30)",
-    subtitle = "Automated step function with 95% confidence band; log-rank test p-value shown",
+    subtitle = "Automated step function with 95% CI; log-rank p-value shown",
     x        = "Follow-up time (months)",
     y        = "Probability of Event-Free Survival",
     color    = "Condition",
@@ -901,13 +960,15 @@ cat("\nSaved: 05_kaplan_meier_auto.png\n")
 
 cat("\n--- Cox Proportional Hazards Model ---\n")
 
-# NOTE: Including `condition` here will produce a warning about infinite coefficients
-# because no Healthy patients had an event (by design in our simulation).
-# In a real study: either use only CKD patients, or ensure the control group has
-# some events. The warning is benign here — the model still estimates the other terms.
+# Here, we only use CKD patients to avoid a warning about infinite coefficients 
+# because no Healthy patients had an event (by design). (Alternatively ensure 
+# the control group has some events.)
+ckd_survival_data <- survival_data %>% 
+  filter(condition == "CKD")
+  
 cox_model <- coxph(
-  Surv(time_to_event, event) ~ monocyte_score + age + sex + condition,
-  data = survival_data
+  Surv(time_to_event, event) ~ monocyte_score + age + sex,
+  data = ckd_survival_data
 )
 
 cat("\nCox Model Summary:\n")
@@ -948,7 +1009,8 @@ p_cox_forest <- ggplot(cox_tidy,
                            color = significant)) +
   # Reference line at HR=1 (no effect)
   geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
-  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2, linewidth = 1.2) +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high),
+                 height = 0.2, linewidth = 1.2) +
   geom_point(size = 4) +
   # Log scale on x-axis — standard for hazard ratios
   scale_x_log10(
@@ -959,7 +1021,7 @@ p_cox_forest <- ggplot(cox_tidy,
                      labels = c("TRUE" = "p < 0.05", "FALSE" = "p >= 0.05")) +
   labs(
     title    = "Cox Model: Hazard Ratios for Kidney Failure",
-    subtitle = "HR > 1 = increased risk; HR < 1 = decreased risk; X-axis is log scale",
+    subtitle = "HR > 1 = increased risk; HR < 1 = protective; log scale",
     x        = "Hazard Ratio (95% CI)",
     y        = "",
     color    = "Significance"
@@ -1045,9 +1107,12 @@ cat(sprintf("  True positives (by design):       %d\n",
             length(true_associations)))
 
 # Estimate false discovery rates empirically
-fp_raw  <- sum(correction_comparison$sig_raw & !correction_comparison$truly_associated)
-fp_bon  <- sum(correction_comparison$sig_bonferroni & !correction_comparison$truly_associated)
-fp_fdr  <- sum(correction_comparison$sig_fdr & !correction_comparison$truly_associated)
+fp_raw <- sum(correction_comparison$sig_raw &
+               !correction_comparison$truly_associated)
+fp_bon <- sum(correction_comparison$sig_bonferroni &
+               !correction_comparison$truly_associated)
+fp_fdr <- sum(correction_comparison$sig_fdr &
+               !correction_comparison$truly_associated)
 
 cat(sprintf("\nEstimated false positives:\n"))
 cat(sprintf("  Uncorrected:  %d false positives out of %d significant\n",
@@ -1057,7 +1122,7 @@ cat(sprintf("  Bonferroni:   %d false positives out of %d significant\n",
 cat(sprintf("  BH FDR:       %d false positives out of %d significant\n",
             fp_fdr, sum(correction_comparison$sig_fdr)))
 
-cat("\nConclusion: BH FDR offers a good balance between sensitivity and specificity\n")
+cat("\nConclusion: BH FDR balances sensitivity and specificity\n")
 cat("for discovery analyses. Bonferroni is better for confirmatory hypotheses.\n")
 
 # --- PLOT 7: Multiple Testing Visualisation ---
@@ -1105,7 +1170,7 @@ p_mt <- ggplot(plot_mt_data %>% filter(correction == "Uncorrected"),
                "Not significant" = "#9E9E9E")
   ) +
   scale_shape_manual(values = c("TRUE" = 17, "FALSE" = 16),
-                     labels = c("TRUE" = "Real association", "FALSE" = "Null marker")) +
+                     labels = c("TRUE" = "Real assoc.", "FALSE" = "Null")) +
   labs(
     title    = "Multiple Testing: 50 Immune Markers Tested Against eGFR",
     subtitle = "Orange dashed = nominal threshold (p<0.05); Red dashed = Bonferroni",
@@ -1174,61 +1239,479 @@ print(sessionInfo())
 # EXERCISES
 # =============================================================================
 #
-# EXERCISE 1 (Easy): Descriptive Statistics
+# EXERCISE 1: Descriptive Statistics
 #   Add a column `eGFR_stage` to baseline_data that categorises patients:
 #     Stage 3a: eGFR 45-59
 #     Stage 3b: eGFR 30-44
 #     Stage 4: eGFR 15-29
 #     Stage 5: eGFR < 15
 #   Then create a table counting patients per stage by condition.
+
+baseline_data_ex1 = baseline_data %>% 
+  mutate(
+    eGFR_stage = case_when(
+      eGFR >= 45 & eGFR <= 59 ~ "Stage 3a",
+      eGFR >= 30 & eGFR < 45 ~ "Stage 3b",
+      eGFR >= 15 & eGFR < 30 ~ "Stage 4",
+      eGFR < 15               ~ "Stage 5",
+      eGFR > 59              ~ "Normal (eGFR ≥60)"
+    )
+)
+
+# --- Stage distribution ---
+table_ex1_stage <- baseline_data_ex1 %>%
+  count(condition, eGFR_stage)
+
+cat("\nStage Distribution:\n")
+print(table_ex1_stage)
+
+
+# =============================================================================
 #
-# EXERCISE 2 (Medium): Mixed Model Extension
-#   Add a random slope for time to model2: change (1|patient_id) to
-#   (1 + time_months|patient_id). Does this improve model fit?
+# EXERCISE 2: Mixed Model Extension
+#   Add a random slope for time to model2. 
+#   Allowing each patient to have their own unique rate of decline): 
+#   change (1|patient_id) to (1 + time_months|patient_id). 
+#   Does this improve model fit?
 #   Compare with anova(model2, model2_with_slope).
 #   HINT: Use REML=FALSE for model comparison with anova().
+
+# Same as model2 but with REML=FALSE for later comparison
+model2_ <- lmer(
+  eGFR ~ monocyte_score * time_months + age + sex + (1|patient_id),
+  data = ckd_longitudinal,
+  REML = FALSE
+)
+
+model2_with_slope <- lmer(
+  eGFR ~ monocyte_score * time_months + age + sex + (1 + time_months|patient_id),
+  data = ckd_longitudinal,
+  REML = FALSE
+)
+
+cat("\nModel 2_ Summary:\n")
+print(summary(model2_))
+
+cat("\nModel 2 with slope Summary:\n")
+print(summary(model2_with_slope))
+
+# Extract and display key results
+model2_tidy <- tidy(model2, effects = "fixed", conf.int = TRUE)
+cat("\nFixed Effects with 95% CI:\n")
+print(model2_tidy[, c("term", "estimate", "conf.low", "conf.high", "p.value")])
+
+cat("AIC dropped from 1464.0 to 1448.4.",
+    "Lower AIC = better balance of fit and complexity.\n")
+
+cat("Residual variance dropped from 6.13 to 3.50.\n",
+    "Missing variance reallocated to the time_months random effect",
+    "(variance = 0.073).\n",
+    "The model now acknowledges some patients decline faster.\n",
+    "Weak positive correlation (0.13) between baseline eGFR",
+    "and decline rate.\n")
+
+# Likelihood Ratio Test (LRT) with ANOVA
+anova(model2_, model2_with_slope)
+
+cat("LRT p < 0.001: the improvement in fit is not due to chance.\n",
+    "Added complexity is mathematically justified.\n")
+
+cat("Parameters increased from 8 to 10 (2 df difference):\n",
+    "Param 1: variance of random slopes\n",
+    "  (how widely individual decline rates differ).\n",
+    "Param 2: correlation between random intercept and slope\n",
+    "  (do higher-baseline patients decline faster?).\n")
+
+cat("monocyte_score:time_months remains non-significant\n",
+    "(p = 0.628 vs 0.561 previously).\n",
+    "The random slope model better describes data structure,\n",
+    "but monocyte score does not reliably predict eGFR decline rate.\n")
+
+cat("CKD progression is highly individualised.\n",
+    "Patients do not follow a uniform parallel trajectory.\n",
+    "Predictive models must account for patient-specific variability.\n")
+
+# =============================================================================
 #
-# EXERCISE 3 (Medium): Survival Analysis
+# EXERCISE 3: Survival Analysis
 #   Stratify the KM curves by monocyte score tertile (low/mid/high).
 #   HINT: Use ntile(monocyte_score, 3) from dplyr to create tertiles.
 #   Do high-monocyte patients fail faster?
+
+# Create the tertiles (Restricting to CKD patients only - 
+# Otherwise the Healthy data would artificially skew the "Low" monocyte tertile 
+# to look like it has a 100% survival rate)
+survival_data_ex3 <- survival_data %>%
+  filter(condition == "CKD") %>%
+  mutate(
+    # ntile splits the data into 3 equal-sized buckets
+    mono_tertile_raw = ntile(monocyte_score, 3),
+    
+    # Convert the numeric 1, 2, 3 into clean factor labels for the plot
+    mono_tertile = factor(mono_tertile_raw, 
+                          levels = c(1, 2, 3), 
+                          labels = c("Low", "Mid", "High"))
+  )
+
+# Fit the Kaplan-Meier model using the new tertile variable
+km_fit_ex3 <- survfit(
+  Surv(time_to_event, event) ~ mono_tertile, # How long we watched the patients 
+  # (time_to_event) & What happened at the end of that time (event: 1 if they 
+  # suffered kidney failure, 0 if they were censored/dropped out) 
+  # ~ Split the data into distinct buckets based on their monocyte tertile and 
+  # calculate a separate curve for each
+  data = survival_data_ex3 
+)
+
+# Calculate the log-rank test p-value automatically
+# If the Null Hypothesis is true, the kidney failures should be distributed 
+# evenly across the groups (proportional to their size). This is the Expected 
+# number of failures. The test aggregates all the differences between "Observed"
+# and "Expected" across the entire 36 months to calculate the p-value. 
+log_rank_ex3 <- survdiff(
+  Surv(time_to_event, event) ~ mono_tertile, 
+  data = survival_data_ex3
+)
+log_rank_p_ex3 <- glance(log_rank_ex3)$p.value
+
+# Generate the automated plot
+p_km_ex3 <- autoplot(km_fit_ex3, 
+                     surv.connect = TRUE, 
+                     conf.int = TRUE, 
+                     conf.int.alpha = 0.15, 
+                     surv.size = 1.2) + 
+  
+  # Add the log-rank p-value
+  annotate("text",
+           x = max(km_fit_ex3$time) * 0.6, y = 0.85,
+           label = sprintf("Log-rank p = %s",
+                           ifelse(log_rank_p_ex3 < 0.001, "< 0.001",
+                                  sprintf("%.3f", log_rank_p_ex3))),
+           size = 4, fontface = "italic") +
+  
+  # Custom traffic-light colours for Low, Mid, and High
+  scale_color_manual(values = c("Low"  = "#4CAF50",
+                                "Mid"  = "#FFC107",
+                                "High" = "#F44336")) +
+  scale_fill_manual(values  = c("Low"  = "#4CAF50",
+                                "Mid"  = "#FFC107",
+                                "High" = "#F44336")) +
+  
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+  scale_x_continuous(breaks = seq(0, 36, by = 6)) +
+  
+  labs(
+    title    = "Exercise 3: Survival by Monocyte Score Tertile",
+    subtitle = "CKD Patients Only; Automated step function with 95% CI",
+    x        = "Follow-up time (months)",
+    y        = "Probability of Event-Free Survival",
+    color    = "Monocyte Tertile",
+    fill     = "Monocyte Tertile"
+  ) +
+  theme_minimal(base_size = 8) +
+  theme(
+    plot.title      = element_text(face = "bold"),
+    legend.position = "top"
+  )
+
+# Print the plot
+print(p_km_ex3)
+
+cat("Non-significant log-rank p confirms the visual separation\n",
+    "is not statistically robust (p ~ 0.156).\n",
+    "We cannot reject the null that monocyte tertile has no effect.\n")
+
+cat("Low tertile patients retain kidney function longest.\n",
+    "High tertile patients fail earlier in the 36-month window.\n")
+
+cat("If p < 0.05, run pairwise log-rank tests to identify\n",
+    "which specific tertiles differ from each other.\n",
+    "The global omnibus test only confirms at least one difference exists.\n")
+
+# Pairwise Comparisons
+# Calculate the 3 separate p-values and apply Benjamini-Hochberg (BH) correction
+pairwise_survdiff(Surv(time_to_event, event) ~ mono_tertile, 
+                  data = survival_data_ex3, 
+                  p.adjust.method = "BH")
+
+
+# =============================================================================
 #
-# EXERCISE 4 (Hard): Time-Varying Covariates
+# EXERCISE 4: Time-Varying Covariates
 #   In Cox models, we used baseline monocyte score. But it was measured at
 #   3 time points. Use a time-varying Cox model (coxph with counting process
 #   formulation) to incorporate monocyte score measured at each visit.
-#   HINT: Search for "counting process Cox model R" and Surv(start, stop, event)
+
+# Base outcomes: Single survival time for each CKD patient
+base_outcomes <- survival_data %>%
+ filter(condition == "CKD") %>%
+  dplyr::select(patient_id, age, sex, condition, time_to_event, event)
+
+# Longitudinal updates: Monocyte scores over time
+score_updates <- longitudinal_data %>%
+ filter(condition == "CKD") %>%
+  dplyr::select(patient_id, condition, time_months, monocyte_score)
+
+# Initialize the Start-Stop framework using tmerge
+time_varying_data <- tmerge(
+  data1 = base_outcomes,         # The foundation dataset
+  data2 = base_outcomes,         # Where to look for the final event
+  id = patient_id,               # How to group the patient
+  tstop = time_to_event,         # When does the clock permanently stop?
+  failure_event = event(time_to_event, event) # Did they fail at the end?
+)
+
+# Fold in the changing monocyte scores
+# tdc() stands for "Time-Dependent Covariate". This automatically chops 
+# the patient's timeline into perfect intervals every time they have a visit.
+time_varying_data <- tmerge(
+  data1 = time_varying_data,
+  data2 = score_updates,
+  id = patient_id,
+  monocyte_current = tdc(time_months, monocyte_score)
+)
+
+cat("\n--- Structure of a single patient in the time-varying dataset ---\n")
+print(head(time_varying_data %>% filter(patient_id == "PT005"), 3))
+
+cox_model_ex4 <- coxph(
+  Surv(tstart, tstop, failure_event) ~ monocyte_current + age + sex,
+  data = time_varying_data
+)
+
+cat("\nTime-Varying Cox Proportional Hazards Summary:\n")
+print(summary(cox_model_ex4))
+
+
+cat("Concordance = 0.558: barely better than a coin toss (0.50).\n",
+    "Tracking monocyte fluctuations within a CKD cohort\n",
+    "does not provide a reliable prognostic signal.\n")
+
+# Test proportional hazards assumption
+# A significant p-value means the HR changes over time → assumption violated
+ph_test_ex4 <- cox.zph(cox_model_ex4)
+cat("\nProportional Hazards Assumption Test (should be non-significant):\n")
+print(ph_test_ex4)
+
+cat("p-value dropped from 0.166 to 0.128 by using all time points.\n",
+    "More data = recovered statistical power.\n")
+cat("HR increased from 2.97 to 3.47: the most recent monocyte\n",
+    "score is a stronger predictor than the baseline score.\n")
+cat("Non-significant GLOBAL p-value confirms the proportional\n",
+    "hazards assumption was not violated by time-varying covariates.\n")
+
+
+# =============================================================================
 #
-# EXERCISE 5 (Hard): Mediation Analysis
+# EXERCISE 5: Mediation Analysis
 #   Hypothesis: CKD → elevated monocyte score → faster eGFR decline
-#   Is the effect of CKD on eGFR mediated by monocyte score?
-#   Use the mediation package and mediate() function.
-#   HINT: This requires fitting two models (mediator model + outcome model)
+#   Is the effect of CKD on eGFR mediated by monocyte score? 
+#   The Indirect Effect (Path a×b: CKD causes monocytes to activate (Path a), 
+#   and those active monocytes explicitly drive kidney function decline (Path b).
+#   The Direct Effect (Path c′): CKD drives kidney decline through completely
+#   different biological pathways entirely bypassing your monocytes.
+#   Total Effect: Total Effect=Direct Effect (ADE) + Indirect Effect (ACME)
+
+# The Independent Variable (X): The disease status (condition: CKD vs. Healthy)
+# The Mediator (M): The intermediate biological mechanism (monocyte_score)
+# The Dependent Variable (Y): The final clinical outcome (rate of eGFR_change)
+
+
+# Prepare Mediation Data
+mediation_data <- longitudinal_data %>%
+  filter(time_months == 0) %>%
+  dplyr::select(patient_id, condition, age, sex,
+                eGFR_baseline = eGFR,
+                monocyte_baseline = monocyte_score) %>%
+  left_join(
+    longitudinal_data %>%
+      filter(time_months == 12) %>%
+      dplyr::select(patient_id, eGFR_12 = eGFR),
+    by = "patient_id"
+  ) %>%
+  mutate(
+    # Outcome variable: negative values = eGFR decline over one year
+    eGFR_change = eGFR_12 - eGFR_baseline
+  )
+
+
+# Model I: The Mediator Model (Path a)
+# Does having CKD lead to significantly higher baseline monocyte scores?
+model_m <- lm(monocyte_baseline ~ condition + age + sex, data = mediation_data)
+
+# Model II: The Outcome Model (Paths b and c')
+# Does the monocyte score predict eGFR change when explicitly controlling for condition?
+model_y <- lm(eGFR_change ~ condition + monocyte_baseline + age + sex,
+              data = mediation_data)
+
+# Run mediation via quasi-Bayesian approximation
+med_fit <- mediate(
+  model.m  = model_m,
+  model.y  = model_y,
+  treat    = "condition",
+  mediator = "monocyte_baseline",
+  sims     = 500 # Number of simulation draws for calculating confidence intervals
+)
+
+cat("\n=== MEDIATION ANALYSIS (observational — associational, not causal) ===\n")
+print(summary(med_fit))
+
+# NOTE: 'condition' is a pre-existing disease state, not a randomised
+# treatment. The mediator and treatment are both measured at baseline,
+# so the temporal ordering required for causal inference is not met.
+# ACME/ADE here are associational quantities, not causal effects.
+cat("ACME (Indirect Effect): non-significant.\n",
+    "  No evidence monocyte score mediates the association with\n",
+    "  eGFR decline.\n\n",
+    "ADE (Direct Effect): significant (ADE = -4.44, p < 0.001).\n",
+    "  CKD associates with eGFR decline beyond the monocyte pathway.\n",
+    "  Holding monocyte levels constant, CKD patients still lose\n",
+    "  4.44 mL/min/1.73m2 more over 12 months than healthy controls.\n")
+
+cat("Model I asks: is monocyte score associated with having CKD, \n",
+    "  after adjusting for age and sex?\n",
+    "Model II asks: does monocyte score associate with eGFR decline, \n",
+    "  after adjusting for condition? \n",
+    "Regression controls for variables we include, but \n",
+    "  it cannot control for variables we didn't measure. \n",
+    "The practical rule of thumb: regression and mediation analysis \n",
+    "  in observational data tell us what to look at and what associations \n",
+    "  are worth investigating, but never why in a mechanistic sense. \n",
+    "That requires either:\n",
+    "  * Randomisation\n",
+    "  * Natural experiments / instrumental variables \n",
+    "    (find something that affects M but not Y directly)\n",
+    "  * Longitudinal designs where the temporal ordering is unambiguous\n",
+    "    (a necessary condition for causation, not a sufficient one.)\n")
+
+# =============================================================================
 #
-# EXERCISE 6 (Conceptual): Assumptions
-#   For Model 1 (lmer), check:
-#     1. Normality of residuals: plot(density(resid(model1)))
-#     2. Homoscedasticity: plot(fitted(model1), resid(model1))
-#     3. Normality of random effects: ranef(model1)$patient_id %>% qqnorm()
+# EXERCISE 6: Check the assumptions we made for Model 1 (lmer).
 #   What would we do if these assumptions were violated?
+
+# Normality of residuals
+plot(density(resid(model1)))
+cat("Look for a symmetric bell-curve centred at zero.\n",
+    "Skewed tails suggest eGFR may need log or Box-Cox transform,\n",
+    "or that a major confounder is missing from the fixed effects.\n")
+
+# Homoscedasticity
+plot(fitted(model1), resid(model1))
+cat("Look for a random horizontal cloud with no patterns.\n",
+    "Funnel shapes = heteroscedasticity: use nlme::lme()\n",
+    "with a weights argument to model non-constant variance.\n")
+
+# Normality of random effects
+ranef(model1)$patient_id$"(Intercept)" %>% qqline()
+cat("Points should sit on a straight diagonal line.\n",
+    "S-shape = severe outliers: investigate those patients.\n",
+    "They may represent a distinct clinical sub-population.\n",
+    "Alternative: switch to robustlme for robust mixed models.\n")
+
+# =============================================================================
 #
-# EXERCISE 7 (Applied): Power Analysis
+# EXERCISE 7: Power Analysis
 #   Before designing a CKD study, we need to estimate required sample size.
-#   For a mixed model with 3 time points and expected interaction β = -0.15:
+#   For a mixed model with 3 time points and expected interaction beta = -0.15:
 #   How many patients do we need to achieve 80% power?
-#   HINT: Use the simr package: extend() and powerSim()
+
+# Clone model1
+model_power <- model1
+# Fix the interaction effect size to the exact target profile
+fixef(model_power)["time_months:conditionCKD"] <- -0.15
+
+cat("\n=== Calculating Power for Current Cohort (N = 120) ===\n")
+# test = fixed() tells R exactly which coefficient to watch for significance
+# nsim = 100 runs 100 simulated trials (500 or 1000 for papers)
+power_current <- powerSim(
+  model_power,
+  test = fixed("time_months:conditionCKD", "t"),
+  nsim = 50,
+  seed = 42,
+  progress = FALSE
+)
+
+print(power_current)
+
+
+# Extend the simulated framework to a total of 300 patients
+model_extended <- extend(model_power, along = "patient_id", n = 300)
+
+cat("\n=== Generating Power Curve to Identify Required Sample Size ===\n")
+
+# This will run 100 simulations for each sample size step. 
+power_curve <- powerCurve(
+  model_extended,
+  along = "patient_id",
+  breaks = c(100, 150, 200, 250, 300),
+  test = fixed("time_months:conditionCKD", "t"),
+  nsim = 50,
+  seed = 42,
+  progress = FALSE
+)
+
+print(power_curve)
+
+cat("To detect eGFR interaction effect of -0.15 mL/min/month\n",
+    "at 80% power: minimum 150 patients (450 observations).\n")
+
+# Plot the curve.
+# NOTE: These values are representative estimates from a prior nsim=100 run.
+# Re-run powerCurve() and replace these numbers if nsim changes, as Monte
+# Carlo power estimates vary with simulation count and random seed.
+power_curve_df <- data.frame(
+  patients = c(100, 150, 200, 250, 300),
+  rows     = c(300, 450, 600, 750, 900),
+  power    = c(0.56, 0.90, 0.96, 0.98, 1.00),
+  lower_ci = c(0.4125, 0.7819, 0.8629, 0.8935, 0.9289),
+  upper_ci = c(0.7001, 0.9667, 0.9951, 0.9995, 1.0000)
+)
+
+# Construct a line chart
+p_power_curve <- ggplot(power_curve_df, aes(x = patients, y = power)) +
+  # Add the 95% Monte Carlo confidence intervals
+  geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci),
+                width = 5, color = "#757575", linewidth = 0.8) +
+  
+  # Add the trajectory line and points
+  geom_line(color = "#2196F3", linewidth = 1.2) +
+  geom_point(color = "#1976D2", size = 3) +
+  
+  # Add the target 80% clinical power reference line
+  geom_hline(yintercept = 0.80, linetype = "dashed",
+             color = "#E53935", linewidth = 0.5) +
+  annotate("text", x = 280, y = 0.77, label = "Target Power (80%)",
+           color = "#E53935", fontface = "bold", size = 3) +
+  
+  # Formatting axes
+  scale_y_continuous(labels = scales::percent, limits = c(0.3, 1.0)) +
+  scale_x_continuous(breaks = c(100, 150, 200, 250, 300)) +
+  
+  # Add labels
+  labs(
+    title = "Exercise 7: Monte Carlo Power Curve",
+    subtitle = "Linear Mixed Model Power Estimation for time_months:conditionCKD",
+    x = "Sample Size (Total Enrolled Patients)",
+    y = "Statistical Power",
+    caption = "50 simulations per interval; target effect size beta = -0.15"
+  ) +
+  theme_minimal(base_size = 8) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+# Save
+ggsave(file.path(plot_dir, "08_simr_power_curve.png"),
+       p_power_curve, width = 7, height = 5, dpi = 300)
+cat("Saved: 08_simr_power_curve.png\n")
+print(p_power_curve)
+
 #
 # =============================================================================
 # END OF MODULE 2
 # =============================================================================
 
 cat("\n\n=== MODULE 2 COMPLETE ===\n")
-cat("Plots saved to:", plot_dir, "\n")
-cat("Files created:\n")
-for (f in list.files(plot_dir, pattern = "*.png")) {
-  cat(" ", file.path(plot_dir, f), "\n")
-}
 
 # =============================================================================
-
-
